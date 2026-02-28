@@ -53,6 +53,11 @@ app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
 
 // ── Routes ─────────────────────────────────────────────────────────────────────
+
+app.get('/', (req, res) => {
+  res.send('Welcome to M2N Blog CMS API');
+});
+
 app.use('/api/auth',     loginLimiter, authRoutes);
 app.use('/api/projects', projectRoutes);
 app.use('/api/blogs',    blogRoutes);
