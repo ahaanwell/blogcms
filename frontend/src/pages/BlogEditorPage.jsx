@@ -18,6 +18,16 @@ const InputField = ({ label, hint, children, required }) => (
   </div>
 );
 
+// Only used for AUTO-generating slug from title (not for manual input)
+const toSlug = (str) =>
+  str
+    .toLowerCase()
+    .trim()
+    .replace(/[^a-z0-9\s-]/g, ' ')
+    .replace(/\s+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '');
+
 const BlogEditorPage = () => {
   const { id } = useParams();
   const isEditing = Boolean(id);
@@ -29,20 +39,20 @@ const BlogEditorPage = () => {
 
   const [form, setForm] = useState({
     title: '',
+    slug: '',
     project: '',
     content: '',
     metaTitle: '',
     metaDescription: '',
     status: 'draft',
   });
+  const [slugManuallyEdited, setSlugManuallyEdited] = useState(false);
   const [imageFile, setImageFile] = useState(null);
   const [imagePreview, setImagePreview] = useState(null);
 
   useEffect(() => {
     dispatch(fetchProjects());
-    if (isEditing) {
-      dispatch(fetchBlogById(id));
-    }
+    if (isEditing) dispatch(fetchBlogById(id));
     return () => dispatch(clearCurrentBlog());
   }, [dispatch, id, isEditing]);
 
@@ -50,23 +60,69 @@ const BlogEditorPage = () => {
     if (isEditing && currentBlog) {
       setForm({
         title: currentBlog.title || '',
+        slug: currentBlog.slug || '',
         project: currentBlog.project?._id || currentBlog.project || '',
         content: currentBlog.content || '',
         metaTitle: currentBlog.metaTitle || '',
         metaDescription: currentBlog.metaDescription || '',
         status: currentBlog.status || 'draft',
       });
+      setSlugManuallyEdited(true);
       setImagePreview(currentBlog.featuredImage?.url || null);
     }
   }, [currentBlog, isEditing]);
 
+  // Auto-generate slug from title ONLY if admin hasn't manually edited slug
+  const handleTitleChange = (e) => {
+    const title = e.target.value;
+    setForm((f) => ({
+      ...f,
+      title,
+      slug: slugManuallyEdited ? f.slug : toSlug(title),
+      metaTitle: f.metaTitle || title,
+    }));
+  };
+
+  // Allow only a-z, 0-9, hyphen — block everything else at keystroke level
+  const handleSlugKeyDown = (e) => {
+    const allowed = /^[a-z0-9-]$/;
+    const controlKeys = [
+      'Backspace', 'Delete', 'ArrowLeft', 'ArrowRight',
+      'Home', 'End', 'Tab', 'Enter',
+    ];
+    // Allow Ctrl+A, Ctrl+C, Ctrl+V, Ctrl+X
+    if (e.ctrlKey || e.metaKey) return;
+    if (!allowed.test(e.key) && !controlKeys.includes(e.key)) {
+      e.preventDefault();
+    }
+  };
+
+  // Store raw value — only lowercase it, don't sanitize on every keystroke
+  const handleSlugChange = (e) => {
+    setSlugManuallyEdited(true);
+    const raw = e.target.value.toLowerCase();
+    setForm((f) => ({ ...f, slug: raw }));
+  };
+
+  // On blur: collapse multiple hyphens and trim edges
+  const handleSlugBlur = () => {
+    if (!form.slug.trim()) {
+      // Empty — reset to auto-generate from title
+      setSlugManuallyEdited(false);
+      setForm((f) => ({ ...f, slug: toSlug(f.title) }));
+    } else {
+      // Clean up multiple hyphens and trim, but keep what admin typed
+      setForm((f) => ({
+        ...f,
+        slug: f.slug.replace(/-+/g, '-').replace(/^-|-$/g, ''),
+      }));
+    }
+  };
+
   const handleImageChange = (e) => {
     const file = e.target.files[0];
     if (!file) return;
-    if (file.size > 5 * 1024 * 1024) {
-      toast.error('Image must be under 5MB');
-      return;
-    }
+    if (file.size > 5 * 1024 * 1024) { toast.error('Image must be under 5MB'); return; }
     setImageFile(file);
     setImagePreview(URL.createObjectURL(file));
   };
@@ -76,15 +132,13 @@ const BlogEditorPage = () => {
     if (!form.project) { toast.error('Please select a project'); return; }
     if (!imagePreview && !isEditing) { toast.error('Please upload a featured image'); return; }
     if (!form.content || form.content === '<p></p>') { toast.error('Content cannot be empty'); return; }
+    if (!form.slug.trim()) { toast.error('Slug cannot be empty'); return; }
 
     const fd = new FormData();
     Object.entries({ ...form, status: statusOverride || form.status }).forEach(([k, v]) => fd.append(k, v));
     if (imageFile) fd.append('featuredImage', imageFile);
 
-    const action = isEditing
-      ? updateBlog({ id, formData: fd })
-      : createBlog(fd);
-
+    const action = isEditing ? updateBlog({ id, formData: fd }) : createBlog(fd);
     const result = await dispatch(action);
     if (!result.error) {
       toast.success(isEditing ? 'Blog updated!' : 'Blog created!');
@@ -152,20 +206,70 @@ const BlogEditorPage = () => {
         <div className="grid grid-cols-1 xl:grid-cols-3 gap-6">
           {/* Main Content */}
           <div className="xl:col-span-2 space-y-6">
-            {/* Title */}
-            <div className="bg-slate-800/40 border border-slate-700/60 rounded-xl p-5">
+
+            {/* Title + Slug */}
+            <div className="bg-slate-800/40 border border-slate-700/60 rounded-xl p-5 space-y-4">
               <InputField label="Blog Title" required>
                 <input
                   type="text"
                   required
                   value={form.title}
-                  onChange={(e) => {
-                    setForm({ ...form, title: e.target.value });
-                    if (!form.metaTitle) setForm((f) => ({ ...f, title: e.target.value, metaTitle: e.target.value }));
-                  }}
+                  onChange={handleTitleChange}
                   className={`${inputClass} text-lg font-display`}
                   placeholder="Enter a compelling blog title..."
                 />
+              </InputField>
+
+              {/* Slug field */}
+              <InputField
+                label="URL Slug"
+                required
+                hint={
+                  !slugManuallyEdited
+                    ? 'Auto-generated from title. You can edit it manually.'
+                    : 'Only lowercase letters, numbers and hyphens allowed.'
+                }
+              >
+                <div className="relative">
+                  <span className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-500 text-sm font-mono pointer-events-none select-none">
+                    /blog/
+                  </span>
+                  <input
+                    type="text"
+                    required
+                    value={form.slug}
+                    onChange={handleSlugChange}
+                    onKeyDown={handleSlugKeyDown}
+                    onBlur={handleSlugBlur}
+                    className={`${inputClass} pl-14 font-mono`}
+                    placeholder="hoskote-bangalore"
+                    spellCheck={false}
+                    autoComplete="off"
+                  />
+                  {/* Reset to auto-generated */}
+                  {slugManuallyEdited && form.title && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setSlugManuallyEdited(false);
+                        setForm((f) => ({ ...f, slug: toSlug(f.title) }));
+                      }}
+                      className="absolute right-3 top-1/2 -translate-y-1/2 text-xs font-mono text-slate-500 hover:text-amber-400 transition-colors"
+                      title="Reset to auto-generated slug"
+                    >
+                      ↺ reset
+                    </button>
+                  )}
+                </div>
+
+                {/* Live URL preview */}
+                {form.slug && (
+                  <p className="text-xs font-mono text-slate-600 mt-1.5">
+                    Preview:{' '}
+                    <span className="text-amber-400/70">/blog/</span>
+                    <span className="text-amber-400">{form.slug}</span>
+                  </p>
+                )}
               </InputField>
             </div>
 
@@ -221,9 +325,9 @@ const BlogEditorPage = () => {
             </div>
           </div>
 
-          {/* Sidebar Panel */}
+          {/* Sidebar */}
           <div className="space-y-5">
-            {/* Project Selection */}
+            {/* Project */}
             <div className="bg-slate-800/40 border border-slate-700/60 rounded-xl p-5">
               <h3 className="text-sm font-display font-bold text-white mb-1">Project</h3>
               <p className="text-xs text-slate-500 font-body mb-3">Select which real estate project this blog belongs to.</p>

@@ -8,18 +8,34 @@ const { publicLimiter, adminLimiter } = require('../middleware/rateLimiter');
 const { upload, cloudinary } = require('../config/cloudinary');
 const router = express.Router();
 
-// ── PUBLIC ROUTES ─────────────────────────────────────────────────────────────
-// These require a valid x-api-key that matches the project slug.
-// Each real estate website has its own unique key — it can ONLY fetch
-// its own project's blogs, not other projects.
+// ── HELPER ────────────────────────────────────────────────────────────────────
+const uniqueSlugForProject = async (baseSlug, projectId, excludeId = null) => {
+  let slug = baseSlug;
+  let counter = 1;
 
-/**
- * GET /api/blogs/project/:projectSlug
- * Used by project websites to fetch their own blogs.
- *
- * Required header:  x-api-key: sk_sobha_xxxxx
- * The key must be registered for "sobha-neopolis" in .env PROJECT_API_KEYS
- */
+  while (true) {
+    const query = { slug, project: projectId };
+    if (excludeId) query._id = { $ne: excludeId };
+
+    const existing = await Blog.findOne(query);
+    if (!existing) return slug;
+
+    counter++;
+    slug = `${baseSlug}-${counter}`;
+  }
+};
+
+// Sanitize slug — allow letters, numbers, hyphens only
+const sanitizeSlug = (str) =>
+  str
+    .toLowerCase()
+    .trim()
+    .replace(/[^a-z0-9-]/g, '-')  // replace invalid chars with hyphen
+    .replace(/-+/g, '-')           // collapse multiple hyphens
+    .replace(/^-|-$/g, '');        // trim leading/trailing hyphens
+
+// ── PUBLIC ROUTES ─────────────────────────────────────────────────────────────
+
 router.get('/project/:projectSlug', publicLimiter, projectApiKey, async (req, res) => {
   try {
     const { page = 1, limit = 10 } = req.query;
@@ -29,18 +45,12 @@ router.get('/project/:projectSlug', publicLimiter, projectApiKey, async (req, re
       isActive: true,
     });
 
-    if (!project) {
-      return res.status(404).json({ message: 'Project not found' });
-    }
+    if (!project) return res.status(404).json({ message: 'Project not found' });
 
-    const total = await Blog.countDocuments({
-      project: project._id,
-      status: 'published',
-    });
+    const total = await Blog.countDocuments({ project: project._id, status: 'published' });
 
     const blogs = await Blog.find({ project: project._id, status: 'published' })
       .select('title slug featuredImage metaTitle metaDescription publishedAt createdAt')
-      .populate('project', 'name slug')
       .sort('-publishedAt')
       .skip((page - 1) * limit)
       .limit(Number(limit))
@@ -58,22 +68,22 @@ router.get('/project/:projectSlug', publicLimiter, projectApiKey, async (req, re
   }
 });
 
-/**
- * GET /api/blogs/slug/:slug
- * Used by project websites for the blog detail page.
- * Also requires the project's API key.
- */
-router.get('/slug/:slug', publicLimiter, projectApiKey, async (req, res) => {
+router.get('/project/:projectSlug/slug/:slug', publicLimiter, projectApiKey, async (req, res) => {
   try {
-    const blog = await Blog.findOne({ slug: req.params.slug, status: 'published' })
-      .populate('project', 'name slug');
+    const project = await Project.findOne({
+      slug: req.params.projectSlug,
+      isActive: true,
+    });
+
+    if (!project) return res.status(404).json({ message: 'Project not found' });
+
+    const blog = await Blog.findOne({
+      slug: req.params.slug,
+      project: project._id,
+      status: 'published',
+    })
 
     if (!blog) return res.status(404).json({ message: 'Blog not found' });
-
-    // Extra check: make sure this key is authorized for this blog's project
-    if (req.apiKeyProjectSlug && blog.project?.slug !== req.apiKeyProjectSlug) {
-      return res.status(403).json({ message: 'This API key is not authorized for this blog.' });
-    }
 
     res.json(blog);
   } catch (err) {
@@ -82,9 +92,7 @@ router.get('/slug/:slug', publicLimiter, projectApiKey, async (req, res) => {
 });
 
 // ── ADMIN ROUTES ──────────────────────────────────────────────────────────────
-// All require JWT Bearer token from admin login.
 
-// Get all blogs (with filters)
 router.get('/', protect, adminLimiter, async (req, res) => {
   try {
     const { project, status, page = 1, limit = 10, search } = req.query;
@@ -106,7 +114,6 @@ router.get('/', protect, adminLimiter, async (req, res) => {
   }
 });
 
-// Get single blog by ID
 router.get('/:id', protect, adminLimiter, async (req, res) => {
   try {
     const blog = await Blog.findById(req.params.id).populate('project');
@@ -122,11 +129,19 @@ router.post('/', protect, adminLimiter, upload.single('featuredImage'), async (r
   try {
     if (!req.file) return res.status(400).json({ message: 'Featured image is required' });
 
-    const { title, content, project, metaTitle, metaDescription, status } = req.body;
+    const { title, content, project, metaTitle, metaDescription, status, slug: rawSlug } = req.body;
 
-    let slug = slugify(title, { lower: true, strict: true });
-    const existing = await Blog.findOne({ slug });
-    if (existing) slug = `${slug}-${Date.now()}`;
+    if (!project) return res.status(400).json({ message: 'Project is required' });
+
+    // Use admin's custom slug if provided, otherwise generate from title
+    const baseSlug = rawSlug
+      ? sanitizeSlug(rawSlug)
+      : sanitizeSlug(slugify(title, { lower: true, strict: true }));
+
+    if (!baseSlug) return res.status(400).json({ message: 'Invalid slug' });
+
+    // Ensure unique within this project
+    const slug = await uniqueSlugForProject(baseSlug, project);
 
     const blog = await Blog.create({
       title,
@@ -159,11 +174,18 @@ router.put('/:id', protect, adminLimiter, upload.single('featuredImage'), async 
       updates.featuredImage = { url: req.file.path, publicId: req.file.filename };
     }
 
-    if (req.body.title && req.body.title !== blog.title) {
-      let slug = slugify(req.body.title, { lower: true, strict: true });
-      const existing = await Blog.findOne({ slug, _id: { $ne: blog._id } });
-      if (existing) slug = `${slug}-${Date.now()}`;
-      updates.slug = slug;
+    // If admin sent a custom slug — use it (sanitized + unique check)
+    // If title changed but no custom slug — generate from new title
+    // If neither — keep existing slug
+    if (req.body.slug) {
+      const baseSlug = sanitizeSlug(req.body.slug);
+      if (!baseSlug) return res.status(400).json({ message: 'Invalid slug' });
+      const projectId = req.body.project || blog.project;
+      updates.slug = await uniqueSlugForProject(baseSlug, projectId, blog._id);
+    } else if (req.body.title && req.body.title !== blog.title) {
+      const baseSlug = sanitizeSlug(slugify(req.body.title, { lower: true, strict: true }));
+      const projectId = req.body.project || blog.project;
+      updates.slug = await uniqueSlugForProject(baseSlug, projectId, blog._id);
     }
 
     const updated = await Blog.findByIdAndUpdate(req.params.id, updates, { new: true })
@@ -174,7 +196,6 @@ router.put('/:id', protect, adminLimiter, upload.single('featuredImage'), async 
   }
 });
 
-// Delete blog
 router.delete('/:id', protect, adminLimiter, async (req, res) => {
   try {
     const blog = await Blog.findById(req.params.id);
