@@ -52,8 +52,6 @@ router.get('/project/:projectSlug', publicLimiter, projectApiKey, async (req, re
     const blogs = await Blog.find({ project: project._id, status: 'published' })
       .select('title slug featuredImage metaTitle metaDescription publishedAt createdAt')
       .sort('-publishedAt')
-      .skip((page - 1) * limit)
-      .limit(Number(limit))
       .lean();
 
     res.json({
